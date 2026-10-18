@@ -23,6 +23,28 @@
 hs_err_pid*
 replay_pid*
 
-# Variables de entorno
+# Maven
+target/
+!**/src/main/**/target/
+!**/src/test/**/target/
+# Keep the Maven wrapper jar (overrides the *.jar rule above)
+!.mvn/wrapper/maven-wrapper.jar
+HELP.md
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment variables (only .env.example is committed)
 .env
 .claude/settings.local.json
