@@ -1,12 +1,12 @@
 # Event contracts
 
-> **DRAFT — pending review.** Field names, types and the topic name may still change. Items marked **TBD** depend on decisions not taken yet.
+> **Status: proposed — pending review.** Field names, types and the topic name may still change until notification-service is built.
 
 There is no shared library between services. Each service defines its own Java class for an event; the contract below (JSON on the wire) is the single source of truth. Producer and consumer must both follow it.
 
 ## TransferCompleted
 
-Published by **transfer-service** when a transfer has been applied by account-service and marked as completed. Consumed by **notification-service**.
+Published by **transfer-service** when a transfer moves to `COMPLETED`: after a successful confirmation, or when a cancellation discovers that account-service had already applied it. Consumed by **notification-service**.
 
 | Property | Value |
 |---|---|
@@ -28,10 +28,10 @@ Published by **transfer-service** when a transfer has been applied by account-se
 | `transferId` | string (UUID) | yes | Identifier of the transfer in transfer-service. |
 | `sourceAccountId` | string (UUID) | yes | Debited account. |
 | `targetAccountId` | string (UUID) | yes | Credited account. |
-| `amount` | **TBD** | yes | Transferred amount, always positive. Depends on the money decision: either a decimal string (`"125.50"`) or an integer in minor units (`12550`). **Never a JSON floating-point number.** |
+| `amount` | string (decimal) | yes | Transferred amount, always positive, with exactly the number of decimals of the currency (e.g. `"125.50"` for EUR, `"1250"` for JPY). **Never a JSON number**, so that no client parses it as a floating-point value. |
 | `currency` | string (ISO 4217) | yes | Currency code, e.g. `"EUR"`. |
 
-### Example (amount format TBD)
+### Example
 
 ```json
 {
@@ -47,16 +47,28 @@ Published by **transfer-service** when a transfer has been applied by account-se
 }
 ```
 
-## Deduplication rule
+## One event per transfer (producer rule)
 
-Kafka delivers at least once, so the same event can arrive more than once (producer retries, consumer rebalances, a crash before the offset is committed).
+Deduplication by `eventId` only works if each transfer produces a single `eventId`. transfer-service guarantees it: the event is created and published **only by the request that wins the conditional transition to `COMPLETED`**. Any other request (a concurrent retry, or an instance whose lease was taken over) loses that transition and publishes nothing.
 
-1. notification-service stores the `eventId` of every processed event under a **database unique constraint**.
-2. Storing the notification and recording the `eventId` happen **in the same database transaction**.
-3. If the insert fails because the `eventId` already exists, the event is a duplicate: it is logged at debug/info level, no new notification is stored, and the message is acknowledged as successfully processed.
-4. The Kafka offset is committed only after the database transaction commits. A crash before the commit leads to a redelivery, which step 3 absorbs.
+Duplicates can still happen on the way (producer retries, consumer rebalances, a crash before the offset is committed), but they all carry the same `eventId`.
 
-Result: one transfer produces exactly one notification, even if the event is delivered several times.
+## Deduplication rule (Idempotent Consumer)
+
+notification-service processes each event in **one database transaction**:
+
+1. **Claim the event first**, as the first statement of the transaction:
+   ```sql
+   INSERT INTO processed_events (event_id, processed_at) VALUES (?, now())
+   ON CONFLICT (event_id) DO NOTHING
+   ```
+2. **0 rows inserted:** the event was already processed. Nothing else is done, and the message is acknowledged as successfully processed.
+3. **1 row inserted:** store the notifications in the same transaction. One event may produce several notifications (for example, one for the source account and one for the target account).
+4. The Kafka offset is committed **only after** the database transaction commits. A crash before that leads to a redelivery, which step 2 absorbs.
+
+Why claiming with `ON CONFLICT DO NOTHING` instead of catching a constraint violation: in PostgreSQL a failed statement aborts the whole transaction, and a "check, then insert" leaves a window in which two consumers both see the event as new. With `ON CONFLICT`, if two consumers process the same event at the same time, the second insert waits for the first transaction: it inserts nothing if the first one committed, and claims the event if the first one rolled back.
+
+Result: each transfer produces its notifications exactly once, even if the event is delivered several times.
 
 ## Versioning rules
 
