@@ -20,7 +20,8 @@ Plataforma de pagos de ejemplo (proyecto de portfolio). Monorepo con microservic
 - Un test de arquitectura (ArchUnit) comprueba que domain no importa infrastructure.
 
 ## Reglas
-- Dinero: nunca double. Usar BigDecimal o céntimos (long).
+- Dinero: nunca double. BigDecimal dentro del value object Money, con la escala normalizada a la de la moneda; en BD NUMERIC(19,4) y en la API y los eventos como texto ("125.50").
+- Paquete base: io.github.pr4m1.payments (.account, .transfer, .notification).
 - Todo cambio de esquema va en una migración Flyway; nunca ddl-auto=update.
 - Las transferencias son idempotentes (ver docs/idempotency.md).
 - Los eventos siguen el contrato de docs/events.md y llevan eventId; los consumidores deduplican por eventId.
