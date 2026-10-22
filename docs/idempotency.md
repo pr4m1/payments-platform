@@ -1,48 +1,85 @@
 # Idempotency
 
-> **TEMPLATE — decisions pending.** This document lists the questions that define how `POST /transfers` behaves when a request is repeated, the reasonable options for each one, and their trade-offs. The "Decision" column will be filled in once each rule is chosen.
+> Status: decisions taken. The values in "Timing parameters" are initial defaults and will be configurable.
 
 ## Goal
 
-A client may send the same transfer more than once (network timeouts, client retries, double clicks). Money must move **at most once** per logical transfer, and the client must be able to retry safely and learn the outcome.
+A client may send the same request more than once (network timeouts, client retries, double clicks). Money must move **at most once** per transfer, and the client must be able to retry safely and learn the outcome.
 
-The client identifies a logical transfer with the `Idempotency-Key` HTTP header.
+## Model
 
-## Questions and options
+Transfers are made in two steps (see [architecture.md](architecture.md)):
 
-| # | Question | Option | Pros | Cons | Decision |
-|---|---|---|---|---|---|
-| 1 | What identifies a repeated request? | **A.** Key unique per client (client id + key) | Clients cannot collide with or see each other's keys. Common practice in public payment APIs. | Needs a client identity. Without authentication in v0.1 it would be a trusted header (e.g. `X-Client-Id`). | Pending |
-| | | **B.** Global key (key alone) | Simplest: one unique constraint. Works without authentication. | Two clients choosing the same key collide (unlikely if UUIDs are required). One client could replay another client's key and read its result. | |
-| | | **C.** No key: hash of the request body | No client cooperation needed. | Two legitimate identical transfers (same accounts and amount) would be treated as one. Does not use the required header. | |
-| 2 | Same key, different body? | **A.** Reject with `422 Unprocessable Content` (store a fingerprint/hash of the request and compare) | Detects client bugs instead of hiding them. Matches the IETF `Idempotency-Key` header draft. | Must store and compare a fingerprint. It must be computed from the parsed request, not raw bytes (field order and whitespace differ). | Pending |
-| | | **B.** Ignore the new body and return the original result | Simplest to implement. | Silently hides client bugs: the client believes a different transfer was executed. | |
-| | | **C.** Reject with `409 Conflict` | Also explicit. | `409` is usually reserved for "request in progress" (question 4); using it for both makes them hard to tell apart. | |
-| 3 | What does a retry of an already completed request return? | **A.** Replay the stored response: same status (`201`) and same body | Fully transparent for the client: a retry looks exactly like the first answer. | The response (or enough data to rebuild it) must be stored. | Pending |
-| | | **B.** `200 OK` with the current state of the transfer | No response storage: rebuilt from the transfer row. Shows the current state. | Status differs from the first response; the client must handle `201` and `200`. | |
-| | | **C.** `409 Conflict` pointing to the existing transfer | Explicit that it is a duplicate. | The client must treat an error status as success; retries no longer "just work". | |
-| 4 | What if the first request is still in progress? | **A.** `409 Conflict` immediately (optionally with `Retry-After`) | Simple and non-blocking. Matches the IETF draft. | The client must retry later. | Pending |
-| | | **B.** Wait until the first request finishes (with a maximum wait), then return its result | The client gets the final answer in one call. | Holds threads and connections; needs its own timeout handling; more complex. | |
-| | | **C.** `202 Accepted` with a `Location` to `GET /transfers/{id}` | Fits long-running work; the client polls the status. | Changes the API to an asynchronous model; needs the GET endpoint; more scope. | |
-| 5 | How is a race between two simultaneous requests with the same key avoided? | **A.** Database unique constraint on the key: insert an "in progress" record first; the loser gets a constraint violation and reads the existing record | Guaranteed by the database. Works with several instances. No extra infrastructure. | The record must be committed **before** calling account-service (its own short transaction), so records stuck "in progress" after a crash must be handled (question 6). | Pending |
-| | | **B.** Pessimistic lock (`SELECT ... FOR UPDATE`) or PostgreSQL advisory lock on the key | Serializes requests with the same key cleanly. | Keeping the lock during the HTTP call to account-service keeps a transaction and a connection open during a remote call. Advisory locks are PostgreSQL-specific. | |
-| | | **C.** Check in application code (SELECT, then INSERT) or an in-memory lock | Trivial to write. | Not safe: there is a window between the check and the insert. An in-memory lock does not work with more than one instance. | |
-| | | **D.** Distributed lock (e.g. Redis) | Works across instances without touching the transfer table. | New infrastructure and a new dependency; lock expiry is a classic source of bugs. | |
-| 6 | What if the service crashes halfway? (e.g. after account-service applied the transfer, before it is marked completed) | **A.** A retry with the same key resumes the transfer: if the record is "in progress" and older than a timeout, call account-service again with the same transfer reference | No extra components. Relies on account-service's unique transfer reference, so money never moves twice. | account-service must answer "already applied" with the result instead of an error. Needs a lease/timeout to tell "in progress" from "stuck". Only heals if the client retries. | Pending |
-| | | **B.** Background reconciliation job: periodically finds stale "in progress" transfers and asks account-service for their status | Heals without client action. | More code: a scheduled job and a status endpoint in account-service. | |
-| | | **C.** Mark stale transfers as failed / unknown and leave them for manual review | Simplest. Honest about uncertainty. | Money may have moved while the transfer says "failed": an inconsistent state. | |
-| 7 | How long are keys kept? | **A.** Forever (stored with the transfer) | Simplest. The transfer is a permanent record anyway; full audit trail. | The table and its index grow without bound. Keys can never be reused. | Pending |
-| | | **B.** A fixed retention (e.g. 24 hours) with a cleanup job | Bounded storage. Common practice in payment APIs. | A retry after expiry creates a new transfer. Needs a scheduled cleanup job. Must be documented for clients. | |
-| | | **C.** Separate idempotency table with a retention period; transfers kept forever | Separates idempotency from business data; storage stays bounded. | Two tables to keep consistent. | |
-| 8 | How are duplicate Kafka events handled? | **A.** Unique constraint on `eventId` in the notification table | Guaranteed by the database. Minimal: one table. | Duplicate detection relies on catching a constraint violation. Ties deduplication to this specific side effect. | Pending (deduplication by `eventId` with a DB unique constraint is already agreed; open: where the constraint lives) |
-| | | **B.** Separate `processed_events` table (`eventId` as primary key), written in the same transaction as the notification | Generic: reusable for any future consumer or side effect. | One more table. | |
-| | | **C.** Rely on Kafka exactly-once (idempotent producer + transactions) | Fewer duplicates inside Kafka. | Does not cover writes to the database: the consumer still needs deduplication. Not sufficient on its own. | |
+1. `POST /transfers` creates a transfer in `CREATED` and returns its `transferId`, a UUID generated by the server. No money moves, so this step does not need to be idempotent.
+2. `POST /transfers/{id}/confirm` moves the money. **This is the idempotent step, and the `transferId` is its idempotency key.**
 
-## Sub-questions to settle alongside the table
+## Decisions
 
-- Is the `Idempotency-Key` header mandatory? What is returned when it is missing (`400 Bad Request`?) and what format is accepted (any string up to N characters, or UUID only)?
-- If the first request ended in a **business error** (e.g. insufficient funds), does a retry replay that error, or is it executed again?
-- If the call to account-service **times out**, the outcome is unknown: what status does the transfer get and what does the client receive?
+| # | Question | Decision | Why | Alternatives considered |
+|---|---|---|---|---|
+| 1 | What identifies a repeated request? | The `transferId`, generated by the server at creation. Repeated confirmations of the same transfer are the same operation. | The key is the transfer itself: no client-generated keys, no separate table, no collisions between clients. | Client-generated `Idempotency-Key` header (per client or global); hash of the request body. |
+| | *Consequence* | Creation is **not** idempotent: a retried `POST /transfers` may create a second transfer in `CREATED`. | Accepted: a `CREATED` transfer never moves money, and it expires (question 7). | |
+| 2 | What if the transfer changed between what the client saw and the confirmation? (replaces "same key, different body", which does not apply: confirmation has no body) | Edit and confirm require `If-Match` with the transfer version (returned as `ETag`). A different version returns `412 Precondition Failed`; a missing header returns `428 Precondition Required`. | A client never confirms an amount it has not seen (e.g. edited from another tab). Uses the same `@Version` already used for optimistic locking. | Ignore it and confirm the current data. |
+| 3 | What does a retry of a finished confirmation return? | **Exactly the same as the first time**, status and body: `200` for `COMPLETED`, and the same `422` `ProblemDetail` for `FAILED` (business errors are not executed again). The response is rebuilt from the transfer state, so it does not need to be stored. | A retry looks exactly like the first answer, so retries are transparent for the client. | `200` with the current state; `409 Conflict` pointing to the existing transfer. |
+| | *Consequence* | `If-Match` is only checked when the transfer is `CREATED`. A finished transfer is replayed whatever the version sent (its version changed when it was confirmed). | Otherwise a retry would always get `412` instead of the original answer. | |
+| 4 | What if the first confirmation is still in progress? | The request **waits** for the first one (polling) up to a maximum wait and then returns its result. If the wait runs out, it returns `409 Conflict` with `Retry-After` and a `ProblemDetail` saying the confirmation is still in progress and must be retried. | The client usually gets the final answer in a single call. | Return `409` immediately; `202 Accepted` with polling by the client. |
+| 5 | How is a race between simultaneous confirmations avoided? | **Atomic state transition** in its own short transaction: `UPDATE transfers SET status = 'CONFIRMING', ... WHERE id = ? AND status = 'CREATED' AND version = ?`. Updating 1 row means the request won and calls account-service; 0 rows means another request won, and this one reads the state and waits (question 4). | Guaranteed by the database, safe with several instances, and no database connection is held during the HTTP call. Second safety net: account-service applies each reference at most once. | Pessimistic lock (`SELECT ... FOR UPDATE`) held during the HTTP call (every waiting request holds a connection; the pool runs out under load); check-then-insert in code or an in-memory lock (unsafe); distributed lock (new infrastructure). |
+| 6 | What if something fails halfway? | (a) **Technical errors** (timeout, connection error, `5xx`) calling account-service are retried once automatically; business errors never. (b) If the outcome is still unknown, the transfer moves to `NEEDS_REVIEW` and the response says so (`503` with a `ProblemDetail`); the client can **retry** (confirm again) or **cancel**. (c) **Cancel only if it is guaranteed that no money moved**: the cancellation goes through account-service (see below). (d) A **30-second lease** on in-progress states: if the instance handling a confirmation crashes, another request can take it over once the lease has expired. | Retrying is always safe because account-service applies each reference at most once. A transfer is never marked `CANCELLED` while money might have moved. | Background reconciliation job; marking stale transfers as failed (could say "failed" while money moved). |
+| 7 | How long are keys kept? | Not applicable as such: the key is the `transferId`, which is the transfer itself and is kept forever as a business record. The related question is **how long a transfer can stay unconfirmed**: each transfer has an `expires_at`, **checked when confirming**. Confirming after it moves the transfer to `EXPIRED` and returns `409`. | Orphan transfers cannot be confirmed by mistake long after they were created. No scheduled job is needed. | No expiry; a scheduled job marking transfers as `EXPIRED`. |
+| 8 | How are duplicate Kafka events handled? | **Idempotent Consumer**: notification-service claims each `eventId` with `INSERT INTO processed_events ... ON CONFLICT (event_id) DO NOTHING` as the first statement of the transaction that stores the notifications. 0 rows inserted means duplicate: skip and acknowledge. | Safe under concurrency, no exception that aborts the PostgreSQL transaction, and independent of how many notifications an event produces. Details in [events.md](events.md). | Unique constraint on `event_id` in the notifications table (breaks when one event produces several notifications); Kafka exactly-once alone (does not cover database writes). |
+
+## Confirm responses by state
+
+What `POST /transfers/{id}/confirm` returns, depending on the state of the transfer when the request arrives:
+
+| State | What happens | Response |
+|---|---|---|
+| `CREATED`, `If-Match` matches, not expired | Claims the confirmation and calls account-service. | `200` (`COMPLETED`), `422` (`FAILED`) or `503` (`NEEDS_REVIEW`) |
+| `CREATED`, `If-Match` does not match | Nothing. | `412 Precondition Failed` |
+| `CREATED`, no `If-Match` | Nothing. | `428 Precondition Required` |
+| `CREATED`, past `expires_at` | Moves to `EXPIRED`. | `409 Conflict` |
+| `CONFIRMING` or `CANCELLING` (another request in progress) | Waits up to the maximum wait. If the lease has expired, takes the confirmation over. | The final result, or `409` with `Retry-After` if the wait runs out |
+| `COMPLETED` | Nothing (replay). | `200`, same body as the first time |
+| `FAILED` | Nothing (replay). | `422`, same `ProblemDetail` as the first time |
+| `NEEDS_REVIEW` | Retry: claims the confirmation again (`NEEDS_REVIEW → CONFIRMING`) and calls account-service with the same reference. | Same as `CREATED` |
+| `CANCELLED` or `EXPIRED` | Nothing. | `409 Conflict` |
+
+## Cancellation
+
+`POST /transfers/{id}/cancel`:
+
+- **`CREATED`**: account-service has never been called, so the transfer moves directly to `CANCELLED` (conditional update, so it cannot race with a confirmation).
+- **`NEEDS_REVIEW`**: the outcome of the previous call is unknown, so transfer-service claims the cancellation (`NEEDS_REVIEW → CANCELLING`) and asks account-service to cancel the reference:
+  - The reference was never applied: account-service records it as `CANCELLED` (same primary key as an applied reference), so any late attempt to apply it is rejected. The transfer moves to `CANCELLED`.
+  - The reference was already applied: the cancellation is refused, the transfer moves to `COMPLETED`, `TransferCompleted` is published, and the client gets `409` with a `ProblemDetail` explaining that the transfer had already been applied.
+  - Technical error: the transfer goes back to `NEEDS_REVIEW`.
+- **`CANCELLED`**: replay, `200`.
+- **Any other state** (`CONFIRMING`, `CANCELLING`, `COMPLETED`, `FAILED`, `EXPIRED`): `409 Conflict`.
+
+## Timing parameters
+
+| Parameter | Initial value |
+|---|---|
+| Maximum wait for an in-progress confirmation (question 4) | 5 s |
+| Polling interval while waiting | 200 ms |
+| `RestClient` connect / read timeout | 2 s / 5 s |
+| Automatic retries on technical errors | 1 |
+| Lease on `CONFIRMING` / `CANCELLING` | 30 s |
+| Expiry of an unconfirmed transfer | 24 h |
+
+**Invariant:** the lease must be longer than the longest possible confirmation attempt (2 calls × (2 s + 5 s) plus the retry delay, about 15 s). Otherwise a live, slow instance could have its confirmation taken over while it is still working.
+
+**Single winner even after a takeover:** each claim increments the transfer version, and the final transition (`CONFIRMING → COMPLETED`) is conditional on the version of the claim. If an instance's lease was taken over, its final update matches no row, so it neither overwrites the result nor publishes a second event.
+
+## Failure scenarios
+
+| Scenario | Result |
+|---|---|
+| account-service applied the transfer, but the response was lost (timeout) | Automatic retry with the same reference; account-service answers "already applied" with the original result; the transfer moves to `COMPLETED`. |
+| Still no answer after the retry | `NEEDS_REVIEW`. A later confirm or cancel resolves it safely through the reference. |
+| transfer-service crashes in `CONFIRMING` | After the 30-second lease, the next confirm takes over and calls account-service with the same reference. |
+| transfer-service crashes after `COMPLETED`, before publishing | The event is lost (known limitation; next step: transactional outbox). |
+| account-service fails while crediting | Its transaction is rolled back: no movement, no applied reference. |
 
 ## Tests that will prove it works
 
@@ -50,12 +87,16 @@ All tests run against real PostgreSQL (and Kafka where relevant) with Testcontai
 
 | Test | Scenario | Expected result |
 |---|---|---|
-| Concurrency with the same key | 20 simultaneous `POST /transfers` requests with the same key and the same body (started together with a latch). | Exactly one transfer stored; exactly one debit and one credit movement; balances change once. Every response is either the original result or the "in progress" answer chosen in question 4. |
-| Same key, different body | A completed transfer, then the same key with a different amount. | The response chosen in question 2; no new movements; balances unchanged. |
-| Retry of a completed request | The same request sent twice, one after the other. | The response chosen in question 3; only one debit and one credit movement in total. |
-| Crash after the debit | account-service applies the transfer, but transfer-service fails before marking it completed (simulated). Then the client retries (or the job from question 6 runs). | No second movement of money; the transfer ends as completed. |
-
-Related tests that complete the guarantee:
-
-- **Rollback on credit failure** (account-service): if the credit fails, the debit is rolled back and no movement is stored.
-- **Duplicate event** (notification-service): the same `TransferCompleted` delivered twice produces a single notification.
+| Concurrent confirmations | 20 simultaneous confirmations of the same transfer (started together with a latch). | Exactly one debit and one credit; balances change once; every response is `200` with the same body (or `409` if the wait ran out). |
+| Stale version | Edit the transfer, then confirm with the old `If-Match`. | `412`; no movements. |
+| Retry of a completed confirmation | Confirm twice, one after the other. | Same status and body; one debit and one credit in total. |
+| Retry after a business failure | Confirm with insufficient funds, then confirm again. | The same `422` both times; account-service is called only once. |
+| Lost response | account-service applies the transfer, but transfer-service sees a timeout (simulated). | The retry gets "already applied"; the transfer ends `COMPLETED`; no second movement. |
+| Crash in `CONFIRMING` | A transfer left in `CONFIRMING` with an expired lease, then confirmed again. | Taken over; ends `COMPLETED`; money moved once. |
+| Cancel after an unknown outcome, transfer applied | `NEEDS_REVIEW`, account-service had applied it; then cancel. | `409`; the transfer ends `COMPLETED`; the event is published. |
+| Cancel after an unknown outcome, transfer not applied | `NEEDS_REVIEW`, account-service had not applied it; then cancel, then a late apply. | Ends `CANCELLED`; the late apply is rejected; no movements. |
+| Expired transfer | Confirm after `expires_at`. | `409`; ends `EXPIRED`. |
+| Rollback on credit failure (account-service) | The credit fails after the debit. | No movements; balances unchanged; reference not recorded. |
+| Conservation of money (account-service) | Many concurrent transfers between several accounts. | For each account, balance = sum of its movements; the sum of all balances is unchanged. |
+| Opposite transfers (account-service) | A→B and B→A at the same time, repeatedly. | No deadlock errors; balances correct. |
+| Duplicate event (notification-service) | The same `TransferCompleted` delivered twice, also concurrently. | Notifications stored once. |
